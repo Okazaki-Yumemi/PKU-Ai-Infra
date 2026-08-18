@@ -20,4 +20,58 @@ contract: 实现 run(program) -> (regs, cycles)
 
 
 def run(program):
-    raise NotImplementedError("从这里开始写")
+    regs = [i for i in range(32)]
+    mask = [True for _ in range(32)]
+
+    
+    
+    def helper(program,regs,mask):
+        cycle = 0
+        op = regs
+        
+        for instruction in program:
+            if instruction[0] == "add":
+                k = instruction[1]
+                all_false = True
+                for i in range(32):
+                    if mask[i]:
+                        all_false = False
+                        op[i] += k
+                if all_false != True:
+                    cycle += 1
+            elif instruction[0] == "mul":
+                k = instruction[1]
+                all_false = True
+                for i in range(32):
+                    if mask[i]:
+                        all_false = False
+                        op[i] *= k
+                if all_false != True:        
+                    cycle += 1
+            elif instruction[0] == "if_lt":
+                t = instruction[1]
+                then_prog = instruction[2]
+                else_prog = instruction[3]
+
+                mask_then = [op[k] <t and mask[k] for k in range(len(op))]
+
+                mask_else = [op[k]>=t and mask[k] for k in range(len(op))]
+                
+                ans1 = helper(then_prog,op,mask_then)
+                ans2 = helper(else_prog,op,mask_else)
+                
+                cycle += ans1[1]
+                cycle += ans2[1]
+                
+
+        return (op,cycle)
+            
+    return helper(program,regs,mask)
+    
+    
+    
+    
+    
+    
+        
+        
