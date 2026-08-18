@@ -662,3 +662,121 @@ block 1 报到
 (b)程序的正确性可以依赖block的执行顺序吗？这条限制和Guide1.1说的scalable programming model 有什么关系？
 
 > 程序正确性不能依赖不同 block 的执行顺序。CUDA 将 block 设计成可独立调度的工作单元，因此无论 GPU 有多少 SM，都可以按任意顺序、并发程度和批次把 blocks 映射到 SM 上。正是这种 block independence 使同一个 kernel 能自动扩展到不同规模的 GPU，这就是 scalable programming model 的重要基础。
+
+
+# Prob 2.9 (From Scratch)
+
+在`m2_first_kernel/` 下写出完整的 CUDA 程序 saxpy.cu，实现 y ←2.0·x+y（单精度）。要求如下:
+
+- 不允许include common.h。错误检查宏和 cudaEvent 计时都要自己写一遍。
+- 命令行用法：./saxpy <n>，n 是元素个数。输入数据按固定公式生成（都是float）：x[i]= ((i % 2048)- 1024) * 0.5f，y[i] = (i % 1024)- 512。
+- kernel 算完把 y 拷回 host，用 double 累加所有 y[i]，输出一行 SUM=< 总和 >（用printf("SUM=%.0f\n", s) 这样的格式，同一行里可以再带上n和kernel毫秒数），SUM结果将用于对拍检验程序正确性，exitcode 应为0
+- n=0时输出SUM=0，exit code 为 0（0 个 block 的 kernel launch 是非法的，特判即可）
+
+判测脚本覆盖n∈{0,1,31,1024,1025,2^20,2^20+3}，命令如下
+```bash
+cd assignment01/cuda/m2_first_kernel
+./judge_saxpy.sh saxpy.cu
+```
+
+
+```cpp
+#include <cstdio>
+#include <string>
+#include <cuda_runtime.h>
+#include <cstdlib>
+// kernel
+
+#define CUDA_CHECK(call) do { \
+    cudaError_t err_ = (call); \
+    if (err_ != cudaSuccess){ \
+        std::fprintf(stderr,"[CUDA ERROR] %s:%d | %s\n", \
+        __FILE__,__LINE__, cudaGetErrorString(err_)); \
+        exit(EXIT_FAILURE); \
+    } \
+} while(0)
+
+__global__ void kernel(const float *x, float *y, int n){
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < n) {
+        y[idx] = y[idx] + 2.0f * x[idx];
+    }
+}
+
+int main(int argc , char **argv){
+
+    if (argc != 2){
+        return 1;
+    }
+
+    const int n = std::stoi(argv[1]);
+
+    if (n == 0) {
+        std::printf("SUM=%.0f\n", 0.0);
+        return 0;
+    }
+
+    size_t bytes = (size_t)n * sizeof(float);
+
+    CUDA_CHECK(cudaFree(0));
+
+
+    float *h_x = (float *)malloc(bytes);
+    float *h_y = (float *)malloc(bytes);
+
+    for(int i = 0 ; i < n ; i++){
+        h_x[i] = ((i % 2048) - 1024) * 0.5f;
+        h_y[i] = (i % 1024) - 512;
+    }
+
+    float *d_x, *d_y;
+    CUDA_CHECK(cudaMalloc(&d_x, bytes));
+    CUDA_CHECK(cudaMalloc(&d_y, bytes));
+
+    // ====== 空 4：把 h_a、h_b 拷到 device（注意最后一个方向参数） ======
+    CUDA_CHECK(cudaMemcpy(d_x, h_x, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_y, h_y, bytes, cudaMemcpyHostToDevice));
+
+    int threads = 256;
+    int blocks = (n + threads - 1 ) / threads ;
+    
+    // 计时
+    cudaEvent_t start;
+    cudaEvent_t stop;
+    
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    cudaEventRecord(start, 0);
+    kernel<<<blocks,threads>>>(d_x, d_y, n);
+    CUDA_CHECK(cudaGetLastError());
+    cudaEventRecord(stop, 0);
+
+    cudaEventSynchronize(stop);
+    
+    float kernel_ms = 0.0f;
+    cudaEventElapsedTime(&kernel_ms, start, stop);
+
+    CUDA_CHECK(cudaMemcpy(h_y, d_y, bytes, cudaMemcpyDeviceToHost));
+
+
+    // CPU 计算结果
+    double sum = 0.0;
+    for (int i = 0 ; i < n ; i++){
+        sum += (double)h_y[i];
+    }
+
+    printf("SUM=%.0f\n , kernel_ms=%.4f\n", sum,kernel_ms) ;
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    CUDA_CHECK(cudaFree(d_x));
+    CUDA_CHECK(cudaFree(d_y));
+
+    return 0;
+}
+
+```
