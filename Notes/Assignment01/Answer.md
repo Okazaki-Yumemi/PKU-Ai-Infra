@@ -373,3 +373,81 @@ PASS
 > (a) CUDA kernel launch 对 host 是异步的，launch 返回不代表 GPU 已经完成对结果的写入。因此 CPU 在读取 managed memory 中的结果前必须等待 kernel 完成，否则 CPU 可能与 GPU 对同一数据产生未正确排序的访问。在本代码中，这个同步由 CUDA_CHECK_KERNEL() 内部的 cudaDeviceSynchronize() 完成；原显式内存版本随后还有一次同步式 D2H cudaMemcpy。
 
 > (b) 在本机 RTX 5070 Laptop 的测试中，显式内存管理耗时 58.8 ms，而 Unified Memory 为 14.0 ms，约快 4.2×。Unified Memory 并没有消除 CPU 与 GPU 之间的数据移动，而是把显式 cudaMemcpy 改成由 CUDA runtime/driver 管理的页面迁移和访问。当前平台上这种 managed-memory 路径的开销明显低于原版使用普通 pageable host allocation 加显式 memcpy 的路径，因此测得更快。但该结果依赖 GPU、驱动和系统环境，不能认为 Unified Memory 普遍比显式内存管理更快。
+
+
+# Prob 2.4
+判断对错，可以顺带补一句理由
+
+(a) vectorAdd<<<...>>>(...) 这条语句返回时，kernel 一定已经执行完毕。
+> 错。返回给 CPU 时，不保证任何一个 GPU thread 已经执行完，甚至不能据此判断 kernel 已经开始执行到什么程度。 Kernel launch 对 host 通常是异步的，launch 语句返回只表示 kernel 已经被提交，不代表 kernel 已经执行完毕；如果 host 后续必须等待 GPU 结果，需要显式同步，例如 cudaDeviceSynchronize()
+
+(b) 同一个 stream 里，cudaMemcpy（device 到 host）会等它前面的 kernel 全部完成后才开始拷贝。
+> 会，同一个 stream 里，cudaMemcpy（device → host）会等它前面的 kernel 全部完成后才开始拷贝, 原因是同一个 stream里面的操作具有顺序关系,后面的操作不能因为： “现在 HBM bandwidth 好像有空”
+
+(c) kernel 内部的非法访存，会在启动语句处同步地报出来。
+> 不会，得进入到内核实际执行的时候发现才会报错。然后错误会被传回.
+
+# Prob 2.5 Debug
+修bug：03_bug_launch.cu，详细内容见相关文件
+
+原来的代码:
+
+```cpp
+#include "common.h"
+
+__global__ void vectorAdd(const float *a, const float *b, float *c, int n) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < n) c[idx] = a[idx] + b[idx];
+}
+
+int main() {
+    const int n = 1000003;
+    size_t bytes = (size_t)n * sizeof(float);
+
+    float *h_a = (float *)malloc(bytes);
+    float *h_b = (float *)malloc(bytes);
+    float *h_c = (float *)malloc(bytes);
+    float *h_ref = (float *)malloc(bytes);
+    fill_random(h_a, n, 1);
+    fill_random(h_b, n, 2);
+    for (int i = 0; i < n; i++) h_ref[i] = h_a[i] + h_b[i];
+
+    float *d_a, *d_b, *d_c;
+    CUDA_CHECK(cudaMalloc(&d_a, bytes));
+    CUDA_CHECK(cudaMalloc(&d_b, bytes));
+    CUDA_CHECK(cudaMalloc(&d_c, bytes));
+
+
+    CUDA_CHECK(cudaMemcpy(d_a, h_a, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_c, 0, bytes));
+
+    int threads = 2048;
+    int blocks = (n + threads - 1) / threads;
+    vectorAdd<<<blocks, threads>>>(d_a, d_b, d_c, n);
+    CUDA_CHECK_KERNEL();
+    // 注意：这里故意没有做任何错误检查。
+
+    CUDA_CHECK(cudaMemcpy(h_c, d_c, bytes, cudaMemcpyDeviceToHost));
+    REPORT(check_close(h_c, h_ref, n));
+    return 0;
+}
+```
+
+执行:
+
+```bash
+make run/m2_first_kernel/03_bug_launch
+nvcc -O2 -std=c++17 -I. -arch=native -o bin/m2_first_kernel/03_bug_launch m2_first_kernel/03_bug_launch.cu
+./bin/m2_first_kernel/03_bug_launch
+CUDA error cudaErrorInvalidConfiguration at m2_first_kernel/03_bug_launch.cu:36: invalid configuration argument
+make: *** [ Makefile:24: run/m2_first_kernel/03_bug_launch ] Error 1
+rm bin/m2_first_kernel/03_bug_launch
+```
+
+把thread数目修改到256后恢复正常。
+
+提示说: **// 程序一声不吭？（问题 0.2 打印过的哪个上限和这里有关？）**
+
+回看发现: max threads / block : 1024，改到1024 pass 
+调整到1025之后则失败.
