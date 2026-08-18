@@ -451,3 +451,214 @@ rm bin/m2_first_kernel/03_bug_launch
 
 回看发现: max threads / block : 1024，改到1024 pass 
 调整到1025之后则失败.
+
+一开始没加 CUDA_CHECK_KERNEL() 的时候，kernel会直接不执行如果不去查error，就会往下走.因为前面由cudaMemset(d_c,0,bytes) 使得c里面全0,没有报错而是assertion error
+
+```cpp
+#define CUDA_CHECK_KERNEL()             \
+    do {                                \
+        CUDA_CHECK(cudaGetLastError()); \
+        CUDA_CHECK(cudaDeviceSynchronize()); \
+    } while (0)
+```
+
+这个地方显示的就是这样，使得cudaError能够被捕获
+
+# Prob 2.6
+
+04_matrix_add.cu 用二维的 block 和 grid 处理 1000×700 的矩阵，请填空实现矩阵加法。
+
+```cpp
+// 问题 2.6：二维矩阵加法（填空）。
+// 用二维的 block 和 grid 处理 M x N 矩阵，四个空都和二维索引有关。
+// 填完之前这个文件无法通过编译。
+#include "common.h"
+
+__global__ void matrixAdd(const float *a, const float *b, float *c, int M, int N) {
+    // ====== 空 1：这个线程负责的行号（用 y 方向的内建变量） ======
+    int row = blockDim.y * blockIdx.y + threadIdx.y;
+    // ====== 空 2：这个线程负责的列号（用 x 方向的内建变量） ======
+    int col = blockDim.x * blockIdx.x + threadIdx.x;
+    // ====== 空 3：二维边界保护 ======
+    if (row < M && col < N) {
+        int idx = row * N + col;  // 行优先展开成一维下标
+        c[idx] = a[idx] + b[idx];
+    }
+}
+
+int main() {
+    const int M = 1000, N = 700;  // 都不是 16 的整数倍
+    const long total = (long)M * N;
+    size_t bytes = total * sizeof(float);
+
+    float *h_a = (float *)malloc(bytes);
+    float *h_b = (float *)malloc(bytes);
+    float *h_c = (float *)malloc(bytes);
+    float *h_ref = (float *)malloc(bytes);
+    fill_random(h_a, total, 1);
+    fill_random(h_b, total, 2);
+    for (long i = 0; i < total; i++) h_ref[i] = h_a[i] + h_b[i];
+
+    float *d_a, *d_b, *d_c;
+    CUDA_CHECK(cudaMalloc(&d_a, bytes));
+    CUDA_CHECK(cudaMalloc(&d_b, bytes));
+    CUDA_CHECK(cudaMalloc(&d_c, bytes));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b, bytes, cudaMemcpyHostToDevice));
+
+    dim3 threads(16, 16);  // x 方向 16 列，y 方向 16 行
+    // ====== 空 4：二维 grid——两个方向都要向上取整 ======
+    int block_row = (N + 16 - 1) / 16;
+    int block_col = (M + 16 - 1) / 16;
+    dim3 blocks(block_row, block_col);
+    matrixAdd<<<blocks, threads>>>(d_a, d_b, d_c, M, N);
+    CUDA_CHECK_KERNEL();
+
+    CUDA_CHECK(cudaMemcpy(h_c, d_c, bytes, cudaMemcpyDeviceToHost));
+    REPORT(check_close(h_c, h_ref, total));
+    return 0;
+}
+```
+
+一开始写错了，给行写成M了，实际上 M x N 的矩阵，行大小是 N，改了之后就pass了
+
+
+# Prob2.7 Modify
+
+05_grid_stride.cu 的 launch 被固定成 <<<64, 256>>>，线程总数远小于n，当前FAIL。在launch
+配置不变的前提下，把kernel 改成grid-stride loop，让任意 n 都能 PASS。
+
+```cpp
+// 问题 2.7：grid-stride loop（改造题）。
+// 现状：launch 只给了 64 个 block，线程总数远小于 n，所以输出 FAIL。
+// 任务：不许改 launch 配置，把 kernel 改成 grid-stride loop——每个线程
+//      跨过整个 grid 的步长处理多个元素——让任意 n 都能 PASS。
+// 参考：NVIDIA 博客 "CUDA Pro Tip: Write Flexible Kernels with Grid-Stride Loops"
+//      https://developer.nvidia.com/blog/cuda-pro-tip-write-flexible-kernels-grid-stride-loops/
+#include "common.h"
+
+__global__ void vectorAdd(const float *a, const float *b, float *c, int n) {
+    for(int i = blockIdx.x * blockDim.x + threadIdx.x ; i < n ; i += blockDim.x * gridDim.x){
+        c[i] = a[i] + b[i];
+    }
+}
+
+int main() {
+    const int n = 1<<24;  // 16M 元素，远多于 64 * 256 = 16384 个线程
+    size_t bytes = (size_t)n * sizeof(float);
+
+    float *h_a = (float *)malloc(bytes);
+    float *h_b = (float *)malloc(bytes);
+    float *h_c = (float *)malloc(bytes);
+    float *h_ref = (float *)malloc(bytes);
+    fill_random(h_a, n, 1);
+    fill_random(h_b, n, 2);
+    for (int i = 0; i < n; i++) h_ref[i] = h_a[i] + h_b[i];
+
+    float *d_a, *d_b, *d_c;
+    CUDA_CHECK(cudaMalloc(&d_a, bytes));
+    CUDA_CHECK(cudaMalloc(&d_b, bytes));
+    CUDA_CHECK(cudaMalloc(&d_c, bytes));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_c, 0, bytes));
+
+    vectorAdd<<<64, 256>>>(d_a, d_b, d_c, n);  // launch 配置不许动
+    CUDA_CHECK_KERNEL();
+
+    CUDA_CHECK(cudaMemcpy(h_c, d_c, bytes, cudaMemcpyDeviceToHost));
+    REPORT(check_close(h_c, h_ref, n));
+    return 0;
+}
+```
+
+然后请回答——这种写法的价值在哪里？launch 只有 16384 个线程时，性能上要付出什么代价
+
+> 价值就是flexible，可以让一套kernel适应不同的硬件，问题是这样相当于把一个大任务切开，有了部分串行的性质
+
+## Prob 2.8
+运行下面的程序两三次，观察16个block打印输出的先后。
+
+代码:
+```cpp
+#include "common.h"
+
+__global__ void whoami() {
+    // 让每个 block 的 0 号线程报到。
+    if (threadIdx.x == 0) {
+        printf("block %d 报到\n", blockIdx.x);
+    }
+}
+
+int main() {
+    whoami<<<16, 32>>>();
+    CUDA_CHECK_KERNEL();
+    return 0;
+}
+```
+
+执行:
+```bash
+block 14 报到
+block 12 报到
+block 15 报到
+block 13 报到
+block 10 报到
+block 8 报到
+block 11 报到
+block 6 报到
+block 9 报到
+block 7 报到
+block 4 报到
+block 2 报到
+block 5 报到
+block 0 报到
+block 3 报到
+block 1 报到
+
+=====================
+
+block 14 报到
+block 12 报到
+block 15 报到
+block 13 报到
+block 10 报到
+block 8 报到
+block 11 报到
+block 6 报到
+block 9 报到
+block 7 报到
+block 4 报到
+block 2 报到
+block 5 报到
+block 0 报到
+block 3 报到
+block 1 报到
+
+==================
+
+block 14 报到
+block 12 报到
+block 15 报到
+block 13 报到
+block 10 报到
+block 8 报到
+block 11 报到
+block 6 报到
+block 9 报到
+block 7 报到
+block 4 报到
+block 2 报到
+block 5 报到
+block 0 报到
+block 3 报到
+block 1 报到
+==================
+```
+
+(a) 顺序由谁决定？
+> 不同 block 何时被调度到哪个 SM、以什么先后顺序执行，由 GPU 的硬件/runtime 调度机制决定，程序员不能指定或依赖这个顺序。
+
+(b)程序的正确性可以依赖block的执行顺序吗？这条限制和Guide1.1说的scalable programming model 有什么关系？
+
+> 程序正确性不能依赖不同 block 的执行顺序。CUDA 将 block 设计成可独立调度的工作单元，因此无论 GPU 有多少 SM，都可以按任意顺序、并发程度和批次把 blocks 映射到 SM 上。正是这种 block independence 使同一个 kernel 能自动扩展到不同规模的 GPU，这就是 scalable programming model 的重要基础。
