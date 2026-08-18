@@ -242,3 +242,134 @@ def run(program):
             
     return helper(program,regs,mask)
 ```
+
+
+# Prob 2.1 Fill-in
+
+请填空：m2_first_kernel/01_vector_add.cu ，具体要求见代码注释
+
+```cpp
+// 问题 2.1：向量加法（填空）
+// 六个空各考一个概念，填完编译运行，"PASS"即可。
+// 填完之前这个文件无法通过编译。
+#include "common.h"
+
+// ====== 空 1：kernel 需要什么函数修饰符？ ======
+__global__ void vectorAdd(const float *a, const float *b, float *c, int n) {
+    // ====== 空 2：这个线程负责的全局下标 ======
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // ====== 空 3：边界保护——总线程数可能多于元素个数 ======
+    if (idx < n) {
+        c[idx] = a[idx] + b[idx];
+    }
+}
+
+int main() {
+    const int n = 1000003;  // 故意取一个不是 256 整数倍的数
+    size_t bytes = (size_t)n * sizeof(float);
+
+    float *h_a = (float *)malloc(bytes);
+    float *h_b = (float *)malloc(bytes);
+    float *h_c = (float *)malloc(bytes);
+    float *h_ref = (float *)malloc(bytes);
+    fill_random(h_a, n, 1);
+    fill_random(h_b, n, 2);
+    for (int i = 0; i < n; i++) h_ref[i] = h_a[i] + h_b[i];
+
+    float *d_a, *d_b, *d_c;
+    CUDA_CHECK(cudaMalloc(&d_a, bytes));
+    CUDA_CHECK(cudaMalloc(&d_b, bytes));
+    CUDA_CHECK(cudaMalloc(&d_c, bytes));
+
+    // ====== 空 4：把 h_a、h_b 拷到 device（注意最后一个方向参数） ======
+    CUDA_CHECK(cudaMemcpy(d_a, h_a, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b, bytes, cudaMemcpyHostToDevice));
+
+    int threadsPerBlock = 256;
+    // ====== 空 5：block 数——向上取整，保证覆盖全部 n 个元素 ======
+    int blocksPerGrid = (n + threadsPerBlock -1)/threadsPerBlock;
+
+    // ====== 空 6：启动 kernel（执行配置写在哪里？） ======
+    vectorAdd <<<blocksPerGrid,threadsPerBlock>>> (d_a, d_b, d_c, n);
+    CUDA_CHECK_KERNEL();
+
+    CUDA_CHECK(cudaMemcpy(h_c, d_c, bytes, cudaMemcpyDeviceToHost));
+    REPORT(check_close(h_c, h_ref, n));
+    return 0;
+}
+```
+
+# Prob2.2 (Concept)
+
+常用的修饰符:
+
+| 修饰符            | 修饰什么  | 在哪里执行/存放               | 谁能用                    |
+| -------------- | ----- | ---------------------- | ---------------------- |
+| `__global__`   | 函数    | GPU 上执行                | 通常由 host 用 `<<<>>>` 启动 |
+| `__device__`   | 函数/变量 | device                 | device code            |
+| `__host__`     | 函数    | CPU 上执行                | host code              |
+| `__shared__`   | 变量    | SM 上的 shared memory    | 同一个 block 的 threads    |
+| `__constant__` | 变量    | device constant memory | device threads，只读      |
+| `__managed__`  | 变量    | Unified Memory         | host/device 都可访问       |
+
+
+
+
+为下列五个场景选择正确的修饰符（如__global__等）。
+(a) 在 GPU 上执行、由CPU侧启动的kernel 函数。
+> `__global__`, CPU启动在GPU上执行
+(b) 只会被 kernel 调用的辅助函数。
+> `__device__` 由kernel拿着执行的辅助函数
+(c) host 和 device 代码都要调用的小工具函数。
+> `__host__ __device__` nvcc 为它生成两个版本,host 和 device 都需要访问的函数
+(d) 整个 kernel 运行期间不变、所有线程都要读的系数表。
+> `__constant__` SM上所有线程共同读取的小型只读参数 上面共享的不变的东西
+(e) block 内线程共享的暂存数组
+> `__shared__` SM上共享的东西
+
+# Prob 2.3 (Modify)
+
+`02_vector_add_um.cu` 代码完整，但目前是“显式内存管理”的版本。改之前先按原样编译运行一次，记下耗时——这一版会被你的改动覆盖掉，下面(b)要拿它做对照。然后按文件头的说明改成unified memory 版（cudaMallocManaged），并保持文件头写明的计时窗口不变
+
+然后请回答如下问题：(a)kernel 启动之后、CPU读结果之前，为什么必须有一次同步？在原先的版本里这次同步发生在哪个调用里？(b)对比两版“搬运+kernel+读回”的耗时，分析差距的原因（谁快谁慢都有可能，与使用的卡有关）
+
+before modified:
+
+```bash
+搬运 + kernel + 读回: 58.8 ms
+PASS
+```
+
+改了之后
+
+```bash
+搬运 + kernel + 读回: 14.0 ms
+PASS
+```
+
+具体改动方法:
+
+```cpp
+// CPU初始化阶段
+    float *h_a ;
+    float *h_b ;
+    float *h_c ;
+
+    cudaMallocManaged((void**)&h_a,bytes);
+    cudaMallocManaged((void**)&h_b,bytes);
+    cudaMallocManaged((void**)&h_c,bytes);
+
+    fill_random(h_a, n, 1);
+    fill_random(h_b, n, 2);
+
+
+// 不需要CUDA Malloc 和 CUDA MemCopy, 两边用同一个指针
+
+    vectorAdd<<<blocks, threads>>>(h_a, h_b, h_c, n);
+
+    // kernel直接消费h_a h_b h_c 指针
+```
+
+> (a) CUDA kernel launch 对 host 是异步的，launch 返回不代表 GPU 已经完成对结果的写入。因此 CPU 在读取 managed memory 中的结果前必须等待 kernel 完成，否则 CPU 可能与 GPU 对同一数据产生未正确排序的访问。在本代码中，这个同步由 CUDA_CHECK_KERNEL() 内部的 cudaDeviceSynchronize() 完成；原显式内存版本随后还有一次同步式 D2H cudaMemcpy。
+
+> (b) 在本机 RTX 5070 Laptop 的测试中，显式内存管理耗时 58.8 ms，而 Unified Memory 为 14.0 ms，约快 4.2×。Unified Memory 并没有消除 CPU 与 GPU 之间的数据移动，而是把显式 cudaMemcpy 改成由 CUDA runtime/driver 管理的页面迁移和访问。当前平台上这种 managed-memory 路径的开销明显低于原版使用普通 pageable host allocation 加显式 memcpy 的路径，因此测得更快。但该结果依赖 GPU、驱动和系统环境，不能认为 Unified Memory 普遍比显式内存管理更快。
