@@ -1367,3 +1367,66 @@ cudaOccupancyMaxPotentialBlockSize 建议（smem = 0 时）：blockSize = 768
 (c)表中带宽随occupancy单调下降，但明显不成正比——从100%到75%带宽掉了多少？从37.5%到12.5%又掉了多少？试解释这个差别。
 
 >带宽并不与 occupancy 成正比。在本机上，从 100% occupancy 降到 66.7%，带宽仅从 346.2 GB/s 降到 339.8 GB/s，约下降 1.8%，说明此时 resident warps 仍然足以隐藏 memory latency，并基本饱和 memory pipeline。相反，从 33.3% 降到 16.7% 时，带宽从 297.5 GB/s 降到 176.4 GB/s，约下降 40.7%。此时 resident warps 太少，当部分 warps 等待 memory 时，scheduler 缺少其他 ready warps 可执行，latency 无法被充分隐藏，因此性能快速下降。因此 occupancy 是 latency-hiding capacity 的指标，而不是性能或带宽的线性比例。
+
+
+
+# 5. 计时与异步初步
+
+# Prob 5.1
+运行实验： 
+
+并回答下列问题：
+(a) 哪个数值可以当作kernel 耗时写进报告？
+(b) 另外两个各具体测的是什么？
+
+```bash
+host 计时、不等 GPU :     0.0127 ms
+host 计时、等 GPU   :     0.2544 ms
+cudaEvent 计时      :     0.2632 ms
+```
+
+代码:
+
+```cpp
+
+    // 方式一：host 计时，启动后立刻停表。
+    auto t0 = std::chrono::steady_clock::now();
+    busy<<<blocks, threads>>>(d_out, iters);
+    auto t1 = std::chrono::steady_clock::now();
+    double ms_nosync = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // 方式二：host 计时，等 GPU 干完再停表。
+    t0 = std::chrono::steady_clock::now();
+    busy<<<blocks, threads>>>(d_out, iters);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    t1 = std::chrono::steady_clock::now();
+    double ms_sync = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    // 方式三：cudaEvent 计时。
+    GpuTimer timer;
+    timer.start();
+    busy<<<blocks, threads>>>(d_out, iters);
+    float ms_event = timer.stop_ms();
+```
+
+(a) kernel耗时是cudaEvent计时
+
+(b) 不同步的 host 计时主要测 kernel launch/enqueue 的 host 端开销，并未等待 GPU 完成；同步的 host 计时测从 host 发起 kernel 到 cudaDeviceSynchronize() 确认 GPU 完成的端到端 wall-clock 时间，因此还包含 launch 和同步等 host/runtime 开销。
+
+# prob 5.2 （CONCEPT）
+判断对错，可以顺带补一句理由。
+(a) 同一个 stream 里的操作按提交顺序执行。
+> 对，同一个stream内按照顺序执行，由host提交请求
+
+(b) kernel 启动后，host 代码立刻继续往下执行。
+> 对。 CUDA kernel launch 通常相对于 host 是异步的；host 只等待 launch 被提交并返回，不等待 GPU 完成 kernel。
+
+(c) unified memory 下，CPU 访问一页正被 GPU 占用的内存，会触发缺页与页迁移
+> 对 Unified Memory 由系统维护 CPU/GPU 间的数据一致性；当 CPU 访问当前驻留在 GPU 一侧的 managed page 时，可能通过 page fault 触发页面迁移和相应的同步/一致性处理。
+
+
+# 6 Tile 视角
+
+Guide 从 13.x 起把 tile 编程作为与 SIMT 并列的第二种官方模型写进正文。tile 模型描述的是“一个block 对一块数据做什么”，而 block 内 threads 的分工由编译器决定。此 Module 只做概念铺垫和对照阅读。
