@@ -1117,3 +1117,96 @@ kernel<<<..., ..., 258*sizeof(float)>>>
 > 对，local memory 的 “local” 指的是每个 thread 私有的地址空间，而不是物理位置；其 backing storage 位于片外 device memory（显存）中，访问也可能经过 L1/L2 cache。
 (b) 对数组用运行期才知道的下标做索引，可能迫使它被放进 local memory
 > 对。如果数组使用运行期才能确定的下标，编译器可能无法把数组元素映射到独立的 registers，因此可能把该数组放入 local memory。
+
+# Prob 4.5 Fill-in
+请填空：03_histogram.cu ，具体要求见代码注释。
+
+```cpp
+// 问题 4.5：直方图（填空）。
+// 统计 16M 个字节的值落在 256 个 bucket 里的次数。
+// 注意：多个线程可能同时修改同一个 bucket 的值。
+
+__global__ void histogram(const unsigned char *data, unsigned int *hist, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (; i < n; i += stride) {
+        unsigned char v = data[i];
+        // ====== 空 1：往 hist[v] 里加 1
+        //         该用哪个原子操作？ ======
+        /* 填这里 */;
+        atomicAdd(&hist[v],1);
+    }
+}
+```
+
+atomicAdd 往一个地址上面的值增加等等。
+
+```bash
+平均耗时 2.4442 ms  (6.86 GB/s)
+PASS
+
+平均耗时 2.4756 ms  (6.78 GB/s)
+PASS
+
+平均耗时 2.4486 ms  (6.85 GB/s)
+PASS
+```
+
+
+# Prob 4.6 Modify
+
+04_histogram_priv.cu ：请按要求修改代码。改完测试指令
+
+```cpp
+__global__ void histogram_naive(const unsigned char *data, unsigned int *hist,
+                                int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (; i < n; i += stride) {
+        atomicAdd(&hist[data[i]], 1u);
+    }
+}
+
+__global__ void histogram_priv(const unsigned char *data, unsigned int *hist,
+                               int n) {
+    // TODO：从这里开始写（shared memory 私有化版本）
+    int i = blockIdx.x * blockDim.x + threadIdx.x ;
+    int stride = blockDim.x * gridDim.x;
+    __shared__ unsigned int cnt[BINS];
+    cnt[threadIdx.x] = 0;
+    __syncthreads();
+    for (; i < n; i += stride) {
+        atomicAdd(&cnt[data[i]], 1u);
+    }
+    __syncthreads();
+    if(threadIdx.x == 0){
+        for(int k = 0 ; k < BINS ; k++){
+            atomicAdd(&hist[k], cnt[k]);
+        }
+    }
+}
+```
+```bash
+naive: PASS  平均 2.4448 ms  (6.86 GB/s)
+priv : PASS  平均 0.0783 ms  (214.31 GB/s)
+naive / priv = 31.23x
+```
+
+一定要两个syncthreads,然后我发现还可以再优化
+
+```cpp
+if(threadIdx.x == 0){
+        for(int k = 0 ; k < BINS ; k++){
+```
+
+不如改成
+```cpp
+atomicAdd(&hist[threadIdx.x], cnt[threadIdx.x]);
+```
+
+```bash
+naive: PASS  平均 2.4695 ms  (6.79 GB/s)
+priv : PASS  平均 0.0367 ms  (457.20 GB/s)
+naive / priv = 67.30x
+```
+
