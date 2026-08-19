@@ -1067,3 +1067,53 @@ __global__ void stencil_dynamic(const float *in, float *out, int n) {
 CUDA里面动态 shared memory 的写法是 extern __shared__ float tile[];
 
 大小由 kernel<<<blocks, BLOCK, ???>>>(...); 里面的??? 给出
+
+```text
+
+static shared:
+
+__shared__ float tile[258];
+                   ↑
+             大小写在 kernel 里
+
+
+dynamic shared:
+
+extern __shared__ float tile[];
+                         ↑
+                    kernel 里不写大小
+
+kernel<<<..., ..., 258*sizeof(float)>>>
+                    ↑
+              launch 时决定大小
+```
+
+# Prob 4.3 MODIFY
+
+02_constant_coeff.cu ：按文件头的说明进行修改。修改完后测试
+
+```cpp
+// 问题 4.3：把系数表搬进 constant memory（ MODIFY ）。
+// 下面的 poly_eval_global 把 8 个多项式系数放在 global memory，每个线程读 8 次。
+// 它保留不动，作为对比基准。
+// 任务：
+//   1. 声明 __constant__ float COEF[8]；
+//   2. 在 main 里标了 TODO 的地方用 cudaMemcpyToSymbol 把系数拷进去；
+//   3. 把 poly_eval_const 写成读 COEF 的版本——参数表保持不变（判测代码要用
+//      同一个函数指针类型跑两版），里面不再用 coef 这个指针即可。
+// 两版都要 PASS。评测结果会包含两版的耗时和比值。
+```
+
+在文件外面 (文件作用域) 声明 `__constant__ float COEF[8] `
+
+然后用 `CUDA_CHECK(cudaMemcpyToSymbol(COEF, h_coef, sizeof(h_coef)))` 拷贝.
+
+
+# Prob 4.4 Concept
+
+判断对错，可以顺带补一句理由。
+
+(a) loacl memory 的 "local" 指作用域私有，它实际上在片外显存里
+> 对，local memory 的 “local” 指的是每个 thread 私有的地址空间，而不是物理位置；其 backing storage 位于片外 device memory（显存）中，访问也可能经过 L1/L2 cache。
+(b) 对数组用运行期才知道的下标做索引，可能迫使它被放进 local memory
+> 对。如果数组使用运行期才能确定的下标，编译器可能无法把数组元素映射到独立的 registers，因此可能把该数组放入 local memory。
