@@ -894,3 +894,97 @@ FAIL
 > warp分别是 0~31 32~63 64 ~ 95 96 ~ 127 128 ~ 159 160 ~ 191 192 ~ 223 224 ~ 255
 > 不过 t = 127 时候 255-t = 128 ， 二者不可能在同一个warp，所有warp都是反过来的？
 > 为什么有些位置一直是对的? 假设 warp 0 <-> warp 7, 可能 warp 0先写好了， warp 7 就能全对
+
+# Prob 3.4
+
+__syncthreads 只能同步本 block 内的 threads，那需要全 grid 同步时，标准做法是什么？
+
+> kernel boundary / 拆成多个kernels, cooperative Groups 的 grid.sync() 可以在满足cooperative launch 等特殊条件时实现kernel 内grid-wide synchronization
+
+# Prob 3.5 （FROM-SCRATCH）：block 内归约
+
+
+在03_reduce.cu 里从零实现两个求和归约kernel（判测与计时的代码已经写好）。两个kernel的contract 见文件头。PASS 后，试解释实测性能差距的原因.
+
+（Optional）基于两点事实——
+(a) __shfl_down_sync 是 warp 内寄存器级别的线程间数据交换指令，自带同步效果且延迟极小；
+(b)归约到最后32个元素后，活跃线程若都落在同一个warp里，就不再需要__syncthreads（可以想想为什么）——据此试写出第三版优化后的kernel。测试时只会跑前两版，第三版自己在main里照着加一次run_one调用即可。
+
+```cpp
+__global__ void reduce_interleaved(const float *in, float *out) {
+    // TODO：从这里开始写（交错配对版本）
+    __shared__ float buf[BLOCK];
+    int tid = threadIdx.x;
+
+    buf[tid] = in[tid + blockIdx.x*BLOCK];
+    
+    int s = 1;
+    while( s <= blockDim.x /2){
+        __syncthreads();
+        if(tid % (2*s) == 0){
+            buf[tid] += buf[tid + s];
+        }
+        s *= 2;
+        __syncthreads();
+    }
+    if(tid == 0){
+        out[blockIdx.x] = buf[0];
+    }
+}
+
+__global__ void reduce_contiguous(const float *in, float *out) {
+    // TODO：从这里开始写（连续配对版本）
+    __shared__ float buf[BLOCK];
+    int tid = threadIdx.x;
+    buf[tid] = in[tid + blockIdx.x*BLOCK];
+    int s = blockDim.x / 2;
+    while(s > 0){
+        __syncthreads();
+        if(tid < s){
+            buf[tid] += buf[tid + s];
+        }
+        s/= 2;
+        __syncthreads();
+    }
+    if(tid == 0){
+        out[blockIdx.x] = buf[0];
+    }
+}
+
+__global__ void shuffle_kernel(const float *in , float *out){
+    __shared__ float buf[BLOCK];
+    int tid = threadIdx.x;
+    buf[tid] = in[tid + blockIdx.x * BLOCK];
+    int s = blockDim.x / 2;
+    while(s > 32){
+        __syncthreads();
+        if(tid < s){
+            buf[tid] += buf[tid + s];
+        }
+        s/= 2 ;
+        __syncthreads();
+    }
+
+    if(tid < 32){
+        float v = buf[tid] + buf[tid+32];
+
+        for(int offset = 16; offset > 0; offset/=2 ){
+            v += __shfl_down_sync(0xffffffff, v, offset);
+        }
+
+        if(tid == 0){
+            out[blockIdx.x] = v;
+        }
+    }
+}
+```
+
+> 本机跑出来的时间比较奇怪，interleaved / contiguous 在 0.8 ~ 1.3 都有，估计是本机实验架构的问题，放到A100测试得到的时间就是
+
+- contiguous_ms = 0.0169
+- interleaved_ms = 0.0343
+- shuffle_ms = 0.0101
+
+加速比是 2
+
+测试均通过。完成。
