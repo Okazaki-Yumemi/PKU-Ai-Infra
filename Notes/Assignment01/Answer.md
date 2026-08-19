@@ -988,3 +988,82 @@ __global__ void shuffle_kernel(const float *in , float *out){
 加速比是 2
 
 测试均通过。完成。
+
+
+# 4. 存储空间
+
+# Prob 4.1
+
+补全下表:
+
+| 空间            | 谁可见                        | 生命周期                           | 片上 / 片外                    | 谁管理                |
+| ------------- | -------------------------- | ------------------------------ | -------------------------- | ------------------ |
+| register      | 单个线程                       | 线程                             | **片上**                     | 编译器                |
+| local         | 单个线程                       | 线程 / kernel 执行期间               | **片外**                     | 编译器                |
+| shared        | 一个 block                   | block                          | **片上**                     | 程序员 / kernel       |
+| global        | 整个 grid，且可跨 kernel 使用      | **application / 直到释放**         | **片外**                     | 程序员 / CUDA Runtime |
+| constant      | 整个 grid，只读                 | **application / CUDA context** | **片外**，但有片上 constant cache | 程序员 / CUDA Runtime |
+| L1 / L2 cache | L1：单个 SM；L2：整个 GPU 各 SM 共享 | 硬件动态，无程序员可依赖的内容生命周期            | **片上**                     | GPU 硬件             |
+
+
+# Prob 4.2
+
+请填空：m4_memory/01_stencil.cu ，具体要求见代码注释。
+
+```cpp
+__global__ void stencil_static(const float *in, float *out, int n) {
+    // ====== 空 1：静态 shared 数组，要装下 BLOCK 个元素加两侧 halo ======
+    __shared__ float tile[BLOCK+2];
+
+    int g = blockIdx.x * blockDim.x + threadIdx.x;  // 全局下标
+    int l = threadIdx.x + RADIUS;                   // 在 tile 里的位置
+
+    tile[l] = (g < n) ? in[g] : 0.f;
+    // 块两端的线程多搬一个 halo 元素。 //用 第一个来整体处理，方便
+    if (threadIdx.x < RADIUS) {
+        int left = g - RADIUS;
+        int right = g + BLOCK;
+        tile[l - RADIUS] = (left >= 0) ? in[left] : 0.f;
+        tile[l + BLOCK] = (right < n) ? in[right] : 0.f;
+    }
+
+    // ====== 空 2：在这里补上一行 ======
+    /* 填这里 */
+    __syncthreads();
+
+    if (g < n) {
+        // ====== 空 3：用 tile（不许用 in）算三点平均 ======
+        out[g] = (tile[l-1] + tile[l] + tile[l+1])/3.f;
+    }
+}
+
+__global__ void stencil_dynamic(const float *in, float *out, int n) {
+    // ====== 空 4：动态 shared 数组的声明方式（大小在 launch 时才给出） ======
+    /* 填这里（声明动态 shared 数组 tile）*/
+
+    extern __shared__ float tile[];
+
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    int l = threadIdx.x + RADIUS;
+
+    tile[l] = (g < n) ? in[g] : 0.f;
+    if (threadIdx.x < RADIUS) {
+        int left = g - RADIUS;
+        int right = g + BLOCK;
+        tile[l - RADIUS] = (left >= 0) ? in[left] : 0.f;
+        tile[l + BLOCK] = (right < n) ? in[right] : 0.f;
+    }
+    __syncthreads();
+    if (g < n) {
+        out[g] = (tile[l - 1] + tile[l] + tile[l + 1]) / 3.f;
+    }
+}
+
+    // ====== 空 5：动态 shared 版本的 launch——第三个参数该填多少字节？ ======
+    stencil_dynamic<<<blocks, BLOCK, (BLOCK+2) * sizeof(float)>>>(d_in, d_out, n);
+```
+
+
+CUDA里面动态 shared memory 的写法是 extern __shared__ float tile[];
+
+大小由 kernel<<<blocks, BLOCK, ???>>>(...); 里面的??? 给出
