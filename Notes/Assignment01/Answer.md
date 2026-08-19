@@ -1210,3 +1210,160 @@ priv : PASS  平均 0.0367 ms  (457.20 GB/s)
 naive / priv = 67.30x
 ```
 
+# Prob 4.7 Experiment
+
+运行实验，并根据实验数据填表
+
+
+```cpp
+// stride = 1 时是连续访问；stride 变大后，warp 里相邻线程读的地址
+// 相距 stride 个 float。n 是 2 的幂，& (n-1) 等价于取模。
+__global__ void strided_copy(const float *in, float *out, int n, int stride) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        int j = (long)i * stride & (n - 1);
+        out[i] = in[j];
+    }
+}
+```
+实验结果:
+
+|Stride | 1 | 2 | 4 | 8 | 16 | 32 |
+| ----- | - | - | - | - | -  | -  |
+| GB/s  |334.0| 219.6 | 131.4 | 77.5 | 78.3 | 78.1|
+
+stride = 1 的时候，对于 i = 0, 1, 2, 3, 4, 5而言 (n = 1 << 24 取模看作是自己)
+
+j = 0, 1, 2, 3 , 4, 5
+
+读取 j 是连续的
+
+对于stride = 16
+
+j = 0 , 16, 32, 48, 64, 80
+
+相隔距离很大, 数据访问相隔很大，warp 内 global memory access 的 coalescing（合并访问）变差。
+
+stride≈8 后，memory transaction utilization 已经接近很差的状态，再继续把地址拉开，也没有多少新的损失空间了。
+
+# Prob 4.8 (EXPERIMENT)
+
+```cpp
+// 问题 4.8：occupancy 实验。
+// 思路：shared memory 按 block 分配，一个 block 占得越多，SM 上能同时
+// 驻留的 block 就越少，常驻 warp 数（occupancy）随之下降。下面的 kernel
+// 声明了不实际用于储值的动态 shared memory——计算量和访存量完全不变，
+// 变的只有 SM 上的并行度。
+// 程序对每一档 shared memory 用量做两件事：
+//   1. 用 cudaOccupancyMaxActiveBlocksPerMultiprocessor 查询这一档下
+//      每个 SM 理论上能驻留几个 block，换算成 occupancy；
+//   2. 实测同一个逐元素加法 kernel 的有效带宽。
+// 记录实测数据，并回答相关问题
+
+#include "common.h"
+
+#define BLOCK 256
+
+__global__ void stream_add(const float *a, const float *b, float *c, int n) {
+    extern __shared__ float ballast[];  // 只占 shared memory，不使用
+    (void)ballast;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = a[i] + b[i];
+}
+
+int main() {
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    int smem_sm = (int)prop.sharedMemPerMultiprocessor;
+    int smem_blk_max = (int)prop.sharedMemPerBlockOptin;
+    int max_threads = prop.maxThreadsPerMultiProcessor;
+    printf("%s：shared memory %d KB / SM，最大常驻 %d 线程 / SM\n\n",
+           prop.name, smem_sm / 1024, max_threads);
+
+    // 允许单个 block 申请超过默认上限（48 KB）的动态 shared memory
+    CUDA_CHECK(cudaFuncSetAttribute((const void *)stream_add,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_blk_max));
+
+    const int n = 1 << 26;
+    size_t bytes = (size_t)n * sizeof(float);
+    float *d_a, *d_b, *d_c;
+    CUDA_CHECK(cudaMalloc(&d_a, bytes));
+    CUDA_CHECK(cudaMalloc(&d_b, bytes));
+    CUDA_CHECK(cudaMalloc(&d_c, bytes));
+    CUDA_CHECK(cudaMemset(d_a, 0, bytes));
+    CUDA_CHECK(cudaMemset(d_b, 0, bytes));
+    int nblocks = (n + BLOCK - 1) / BLOCK;
+
+    // shared memory 档位：按每 SM 总量的比例给定。一个 block 占了总量的
+    // 1/x，每 SM 大致就只能驻留 x 个 block。下面六档挑得能在多数卡上落到
+    // 六个不同的驻留块数，但实际落点还受架构影响（有的架构给每个 block
+    // 额外保留一小块 shared），一切以 API 报出来的数为准。
+    const double fracs[] = {0.0, 0.18, 0.23, 0.31, 0.44, 0.55};
+    printf("%-14s %-16s %-11s %s\n",
+           "shared/block", "理论 block/SM", "occupancy", "实测带宽");
+    for (int k = 0; k < 6; k++) {
+        int smem = (int)(smem_sm * fracs[k]);
+        if (smem > smem_blk_max) smem = smem_blk_max;
+
+        int active = 0;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &active, stream_add, BLOCK, smem));
+        double occ = 100.0 * active * BLOCK / max_threads;
+
+        stream_add<<<nblocks, BLOCK, smem>>>(d_a, d_b, d_c, n);  // 热身
+        CUDA_CHECK_KERNEL();
+        const int reps = 20;
+        GpuTimer timer;
+        timer.start();
+        for (int r = 0; r < reps; r++)
+            stream_add<<<nblocks, BLOCK, smem>>>(d_a, d_b, d_c, n);
+        float ms = timer.stop_ms() / reps;
+        CUDA_CHECK_KERNEL();
+        double gbps = 3.0 * bytes / (ms * 1e-3) / 1e9;
+
+        printf("%8.1f KB %10d %14.1f%% %10.1f GB/s\n",
+               smem / 1024.0, active, occ, gbps);
+    }
+
+    // 讲义里提到的另一个 API：让 runtime 建议一个 occupancy 最高的 block size
+    int min_grid = 0, best_block = 0;
+    CUDA_CHECK(cudaOccupancyMaxPotentialBlockSize(
+        &min_grid, &best_block, stream_add, 0, 0));
+    printf("\ncudaOccupancyMaxPotentialBlockSize 建议（smem = 0 时）：blockSize = %d\n",
+           best_block);
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_c));
+    return 0;
+}
+```
+
+
+实验结果
+```bash
+
+NVIDIA GeForce RTX 5070 Laptop GPU：shared memory 100 KB / SM，最大常驻 1536 线程 / SM
+
+shared/block   理论 block/SM  occupancy   实测带宽
+     0.0 KB          6          100.0%      346.2 GB/s
+    18.0 KB          5           83.3%      332.4 GB/s
+    23.0 KB          4           66.7%      339.8 GB/s
+    31.0 KB          3           50.0%      335.9 GB/s
+    44.0 KB          2           33.3%      297.5 GB/s
+    55.0 KB          1           16.7%      176.4 GB/s
+
+cudaOccupancyMaxPotentialBlockSize 建议（smem = 0 时）：blockSize = 768
+```
+
+(a) 用程序开头打印的“shared memory / SM”和“最大常驻线程/SM”，手算其中一个的驻留block 数和 occupancy，和 API 的结果对照。
+
+> 程序中每个block = 256 threads. 例如选择 31.0 KB / block 这个， 100/31 = 3, 只能放3个block, 3x256 = 768 个thread，只占用了一半
+
+(b) 带宽为什么随 occupancy 下降？用“延迟隐藏需要足够多的常驻warp”组织你的解释。
+
+> occupancy 降低意味着每个 SM 上能够同时 resident 的 warps 变少。当一个 warp 因 global memory access 等待时，warp scheduler 可以切换执行的其他 ready warps 也随之减少，因此隐藏 memory latency 的能力下降。当 resident warps 少到不足以持续填满 memory pipeline 时，stall 被暴露出来，有效带宽下降。
+
+(c)表中带宽随occupancy单调下降，但明显不成正比——从100%到75%带宽掉了多少？从37.5%到12.5%又掉了多少？试解释这个差别。
+
+>带宽并不与 occupancy 成正比。在本机上，从 100% occupancy 降到 66.7%，带宽仅从 346.2 GB/s 降到 339.8 GB/s，约下降 1.8%，说明此时 resident warps 仍然足以隐藏 memory latency，并基本饱和 memory pipeline。相反，从 33.3% 降到 16.7% 时，带宽从 297.5 GB/s 降到 176.4 GB/s，约下降 40.7%。此时 resident warps 太少，当部分 warps 等待 memory 时，scheduler 缺少其他 ready warps 可执行，latency 无法被充分隐藏，因此性能快速下降。因此 occupancy 是 latency-hiding capacity 的指标，而不是性能或带宽的线性比例。
