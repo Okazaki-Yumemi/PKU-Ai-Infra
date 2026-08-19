@@ -780,3 +780,117 @@ int main(int argc , char **argv){
 }
 
 ```
+
+# SIMT 执行
+
+# Prob 3.1
+
+设blockDim = (8, 8, 1)。
+(a) threadIdx = (3, 5, 0) 的线性编号是多少？它在第几个 warp、warp 内第几个 lane？
+> linear tid = threadIdx.x + blockDim.x * threadIdx.y + blockDim.x * blockDim.y * threadIdx.z = 3 + 8 x 5 = 43 -> warp_id = 1 , lane_id  = 11
+(b) 这个 block 一共占多少个 warp？
+> 这个block共有 8 * 8 / 32 = 2 个warp
+(c) 若 blockDim = (33, 1, 1)，占几个 warp？这样配置浪费在哪里？
+> 占用 2 个warp ， 其中第二个warp几乎全空，浪费很多空间
+
+# Prob 3.2
+
+m3_simt/01_divergence.cu 的两个 kernel 每线程计算量相同，分支划分不同——一个按 thread编号的奇偶分（同一个warp里一半一半），一个按warp边界对齐分。请先预测一下哪个版本运行会更快一点，大概快几倍，然后运行验证：
+
+> 预测: warp边界对齐，只用执行4个， 分支组可以等价认为执行了8个，所以时间大约是2倍。
+
+```bash
+warp 内分支 (tid % 2)    :    1.455 ms
+按 warp 分支 (tid/32 % 2):    0.749 ms
+比值: 1.94
+
+warp 内分支 (tid % 2)    :    1.448 ms
+按 warp 分支 (tid/32 % 2):    0.752 ms
+比值: 1.93
+
+warp 内分支 (tid % 2)    :    1.459 ms
+按 warp 分支 (tid/32 % 2):    0.774 ms
+比值: 1.88
+```
+
+请解释实测比值，并回答——若两个分支的计算量一大一小，按thread 编号奇偶分的 kernel和按warp 边界对齐分的kernel 的运行时间分别由什么决定
+
+> 实验比率低于理论比率，估计是因为 warp内分支和按照warp分支都会有相对应的 "调度、打包开销"等共同的固定开销。
+> 二者运行时间最显著的差异来源于divergence导致的同一warp内等待的问题
+
+> 两个分支计算量一大一小的话，奇数、偶数分开的计时时间 = T_long + T_short ， 合并的是 T_long
+
+# Prob 3.3
+
+02_sync_matters.cu 让每个 block 用 shared memory 把自己的 256 个元素倒序。请按文件开头的注释内容进行实验。
+
+```cpp
+// 问题 3.3：__syncthreads 实验。
+// 每个 block 把自己的 256 个元素倒序：先搬进 shared memory，同步，
+// 再交叉着读出来。任务：
+//   1. 直接运行，确认 PASS；
+//   2. 注释掉 __syncthreads() 那一行，再运行几次，观察结果；
+//   3. 回答 handout 里的问题。
+
+#include "common.h"
+
+#define BLOCK 256
+
+__global__ void reverse_blocks(const float *in, float *out, int n) {
+    __shared__ float buf[BLOCK];
+    int base = blockIdx.x * BLOCK;
+    int t = threadIdx.x;
+
+    buf[t] = in[base + t];
+    //__syncthreads();  // <-- 实验对象
+    out[base + t] = buf[BLOCK - 1 - t];
+}
+
+int main() {
+    const int nblocks = 4096;
+    const int n = nblocks * BLOCK;
+    size_t bytes = (size_t)n * sizeof(float);
+
+    float *h_in = (float *)malloc(bytes);
+    float *h_out = (float *)malloc(bytes);
+    float *h_ref = (float *)malloc(bytes);
+    fill_random(h_in, n, 7);
+    for (int b = 0; b < nblocks; b++)
+        for (int t = 0; t < BLOCK; t++)
+            h_ref[b * BLOCK + t] = h_in[b * BLOCK + (BLOCK - 1 - t)];
+
+    float *d_in, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_in, bytes));
+    CUDA_CHECK(cudaMalloc(&d_out, bytes));
+    CUDA_CHECK(cudaMemcpy(d_in, h_in, bytes, cudaMemcpyHostToDevice));
+
+    reverse_blocks<<<nblocks, BLOCK>>>(d_in, d_out, n);
+    CUDA_CHECK_KERNEL();
+
+    CUDA_CHECK(cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost));
+    REPORT(check_close(h_out, h_ref, n));
+    return 0;
+}
+```
+
+1. 直接运行
+
+```BASH
+PASS
+```
+
+2. 注释掉
+
+```BASH
+MISMATCH at 0: got 0.000000, want 4.820000
+FAIL
+```
+
+(a) 为什么注释掉 sync 后代码不能正确地运行？
+
+> 观察可知，所有线程都会读取 shared buffer， 然后先把in里面的数据拷贝到buffer里面，最后再将buffer里面的数据倒过来放到out内。 注释掉sync之后，相当于buffer还没有准备就绪，就从里面读取数据送到out内。我们应该等待buf数组读取了所有的数组再倒过来
+
+(b) (Optional) 注释掉 sync 后，翻转后的数组错的位置比较随机，但是有些位置一直是对的，试解释原因。（tip: 算一算t与255−t有没有可能落在同一个warp
+> warp分别是 0~31 32~63 64 ~ 95 96 ~ 127 128 ~ 159 160 ~ 191 192 ~ 223 224 ~ 255
+> 不过 t = 127 时候 255-t = 128 ， 二者不可能在同一个warp，所有warp都是反过来的？
+> 为什么有些位置一直是对的? 假设 warp 0 <-> warp 7, 可能 warp 0先写好了， warp 7 就能全对
