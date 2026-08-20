@@ -24,5 +24,70 @@ import tilelang
 import tilelang.language as T
 
 
+def make_softmax(M, N , BLOCK_M = 1 , threads = 128 , dtype = "float32",num_stages = 3):
+
+    def next_power_of_N(N):
+      if N <= 0:
+        return 1
+      
+      N -= 1
+      N |= N >> 1
+      N |= N >> 2
+      N |= N >> 4
+      N |= N >> 8
+      N |= N >> 16
+      
+      return N+1
+
+    BLOCK_N = next_power_of_N(N)
+    
+    @T.prim_func
+    def main(
+      A: T.Buffer((M,N),dtype),
+      B: T.Buffer((M,N),dtype),
+    ):
+      with T.Kernel(
+        T.ceildiv(N,BLOCK_N),
+        T.ceildiv(M,BLOCK_M),
+        threads= threads,
+      ) as (bx,by):
+        
+        row = T.alloc_fragment((1, BLOCK_N), dtype)
+
+        
+        max_buf = T.alloc_fragment((1,), dtype)
+        sum_buf = T.alloc_fragment((1,), dtype)
+        
+        for j in T.Parallel(BLOCK_N):
+          row[0, j] = T.if_then_else(
+                                      j < N,
+                                      A[by, j],
+                                      -T.infinity(dtype),
+                                  )
+        
+        T.reduce_max(row,max_buf)
+        
+        for j in T.Parallel(BLOCK_N):
+          row[0,j] = T.exp(row[0,j] - max_buf[0])
+        
+        T.reduce_sum(row,sum_buf)
+        
+        for j in T.Parallel(BLOCK_N):
+          B[by,j] = row[0,j] / sum_buf[0]
+
+    return main
+
+
 def softmax(x: torch.Tensor) -> torch.Tensor:
-    raise NotImplementedError("从这里开始写")
+    
+    M:int
+    N:int
+    M= x.shape[0]
+    N = x.shape[1]
+    
+    b = torch.randn((M, N), device="cuda", dtype=torch.float32)
+
+    func = make_softmax(M, N)
+    kernel = tilelang.compile(func, out_idx=[1])
+    result = kernel(x)
+    return result
