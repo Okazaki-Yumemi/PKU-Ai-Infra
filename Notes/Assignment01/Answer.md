@@ -1609,3 +1609,72 @@ def make_scale2d(M, N, block_M=32, block_N=32, dtype="float32"):
     return scale2d
 ```
 
+# prob 7.5 （CONCEPT）
+
+补全下表，每个空填“用户”或“编译器”（二者都涉及的要写清楚各自的范围）
+
+| 谁负责                | CUDA SIMT | cuTile  | Triton  | TileLang                |
+| ------------------ | --------- | ------- | ------- | ----------------------- |
+| 线程到数据的映射| 用户   | **编译器** | **编译器** | **编译器**       |
+| 边界处理  | 用户  | **编译器** | **用户**  | **二者都有**      |
+| tile / block 尺寸的选择 | 用户  | 用户      | 用户      | 用户     |
+| block 内同步   | 用户   | **编译器** | **编译器** | **编译器为主；低层写法也可由用户显式控制** |
+
+# probably7.6 (Fill-in)
+
+请填空：kernels/tilelang_matmul.py ，具体要求见代码注释。
+
+```py
+"""问题 7.6：TileLang tiled matmul（填空）。
+
+C = A @ B，A 形状 (M, K)，B 形状 (K, N)，fp16 输入、fp32 累加。
+共五个空：两块 shared tile、一个 fragment 累加器、沿 K 维的流水
+循环、T.copy 搬运与 T.gemm 计算。
+需要 GPU 和 tilelang（uv sync --extra tilelang），在集群上运行：
+    pytest tests/test_tilelang.py -k matmul
+
+Bonus 用的也是这个文件：填完后调 bench() 里的配置，记录实测数据。
+
+    python -c "from kernels.tilelang_matmul import bench; bench()"
+"""
+
+def make_matmul(M, N, K, BLOCK_M=128, BLOCK_N=128, BLOCK_K=32,
+                threads=128, num_stages=3,
+                dtype="float16", accum_dtype="float32"):
+    @T.prim_func
+    def main(
+        A: T.Buffer((M, K), dtype),
+        B: T.Buffer((K, N), dtype),
+        C: T.Buffer((M, N), accum_dtype),
+    ):
+        with T.Kernel(
+            T.ceildiv(N, BLOCK_N),
+            T.ceildiv(M, BLOCK_M),
+            threads=threads,
+        ) as (bx, by):
+            # ====== 空 1：A、B 各自的 shared tile——形状分别是多少？ ======
+            A_shared = T.alloc_shared((BLOCK_M,BLOCK_K), dtype)
+            B_shared = T.alloc_shared((BLOCK_K,BLOCK_N), dtype)
+
+            # ====== 空 2：C 的累加器 tile，放寄存器（fragment），
+            #         注意精度用 accum_dtype ======
+            C_local = T.alloc_fragment((BLOCK_M,BLOCK_N), accum_dtype)
+
+            T.clear(C_local)
+
+            # ====== 空 3：沿 K 维流水地推进——一共要多少步？提示：T.ceildiv ======
+            for k in T.Pipelined(T.ceildiv(K,BLOCK_K), num_stages=num_stages):
+                # ====== 空 4：把 A、B 的当前 tile 搬进 shared——
+                #         各自的全局起点坐标是多少？ ======
+                T.copy(A[by * BLOCK_M, k * BLOCK_K], A_shared)
+                T.copy(B[k * BLOCK_K, bx * BLOCK_N], B_shared)
+                # ====== 空 5：tile 级乘累加，提示：T.gemm ======
+                T.gemm(A_shared,B_shared,C_local)
+
+            T.copy(C_local, C[by * BLOCK_M, bx * BLOCK_N])
+
+    return main
+```
+
+
+A_shared 和 B_shared 用来边界处理和分小块。然后分成小块分别计算，累加到C对应的位置里面。
