@@ -1955,3 +1955,52 @@ Runtime API通常以 cuda开头，例如 cudaMalloc ， cudaMemcpy ， cudaFree
 
 Driver API 更底层，通常以 cu开头
 
+# BONUS
+
+调参并比较不同matmul 实现的性能差距。
+
+(a) Naive CUDA：cuda/bonus/matmul.cu，用-DBS 取 8、16、32 各跑一遍，记录实测数据。
+
+```bash
+
+$ nvcc -O2 -std=c++17 -I. -arch=native -DBS=8 \
+  -o bin/bonus/matmul_bs8 bonus/matmul.cu && ./bin/bonus/matmul_bs8
+BS=8  平均 1.753 ms  1224.9 GFLOPS
+PASS
+$ nvcc -O2 -std=c++17 -I. -arch=native -DBS=16   -o bin/bonus/matmul_bs8 bonus/matmul.cu && ./bin/bonus/matmul_bs8
+BS=16  平均 1.389 ms  1545.9 GFLOPS
+PASS
+$ nvcc -O2 -std=c++17 -I. -arch=native -DBS=32   -o bin/bonus/matmul_bs8 bonus/matmul.cu && ./bin/bonus/matmul_bs8
+BS=32  平均 1.446 ms  1484.9 GFLOPS
+PASS
+```
+
+(b) Tiled Triton：kernels/matmul_triton.py（多组 tile 配置 + cuBLAS 对照），记录实测数据
+
+```bash
+BLOCK_M=  32 BLOCK_N=  32 BLOCK_K= 32     0.564 ms    30.4 TFLOPS
+BLOCK_M=  64 BLOCK_N=  64 BLOCK_K= 32     0.396 ms    43.4 TFLOPS
+BLOCK_M= 128 BLOCK_N=  64 BLOCK_K= 32     0.397 ms    43.3 TFLOPS
+BLOCK_M= 128 BLOCK_N= 128 BLOCK_K= 32     0.410 ms    41.9 TFLOPS
+BLOCK_M= 128 BLOCK_N= 128 BLOCK_K= 64     0.475 ms    36.1 TFLOPS
+BLOCK_M=  64 BLOCK_N=  64 BLOCK_K= 64     0.394 ms    43.6 TFLOPS
+torch (cuBLAS)                         0.395 ms    43.5 TFLOPS
+```
+
+> 64 × 64 × 64 : 43.6 TFLOPS 情况下已经基本和cuBLAS持平
+
+
+
+(c) TileLang：kernels/tilelang_matmul.py（即 prob 7.6 补全的成品），调 bench() 的 block_M
+/ block_N / block_K / num_stages，记录实测数据。
+
+本机跑不了
+
+
+>Naive CUDA 的最佳配置为 BS=16，达到约 1.55 TFLOPS。较小的 BS=8 并行粒度不足，而 BS=32 达到 1024 threads/block，资源占用和调度灵活性变差，因此两者均慢于 BS=16。
+
+>Triton tiled matmul 的最佳配置为 BLOCK_M=64, BLOCK_N=64, BLOCK_K=64，达到约 43.6 TFLOPS，与本机 cuBLAS 的 43.5 TFLOPS 基本相当，约为 naive CUDA 最佳结果的 28 倍。性能提升主要来自 tiling 带来的数据复用、register accumulation 以及 Tensor Core/MMA 等高吞吐执行路径，而不是编程语言本身。
+
+>Triton 中更大的 tile 并未持续提高性能。128×128×64 反而下降至 36.1 TFLOPS，说明 tile size 存在 reuse 与 resource pressure/occupancy 之间的权衡。
+
+>TileLang 在本机未取得有效 benchmark 数据，因此不将其与本机 CUDA/Triton/cuBLAS 数值直接比较。
