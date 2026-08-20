@@ -1868,3 +1868,90 @@ def softmax(x: torch.Tensor) -> torch.Tensor:
 ```
 
 不得不提，Triton确实比tilelang好写不少.
+
+# 8.平台与编译
+
+# prob 8.1 （CONCEPT）
+
+(a) PTX 是 GPU 直接执行的机器码。
+> PTX 不是 GPU 直接执行的机器码，而是 NVIDIA 的虚拟 ISA。PTX 需要经过 ahead-of-time 的 ptxas 或运行时 driver JIT，生成目标架构对应的 native machine code（SASS，通常封装在 cubin 中）后才能执行。
+(b) 只嵌入了sm_70 SASS 的可执行文件，能在compute capability 9.0 的卡上运行。
+> 错。sm_70 SASS 是针对特定 GPU 架构生成的 native machine code，不能依赖 compute capability 9.0 GPU 对其进行跨 major 架构的向下兼容。若 fatbin 中还包含兼容的 PTX，则 driver 可以在新 GPU 上将 PTX JIT 为目标架构的机器码。
+(c) 一个 fatbin 可以同时携带多个架构的 SASS 和 PTX。
+> 对，官方文档示例提到fatbin可以包含多个cubin，包含PTX虚拟ISA代码
+(d) JIT 编译由驱动在运行时完成。
+> 对。若运行时没有适合当前 GPU 的预编译 cubin/SASS，但 fatbin 中存在兼容 PTX，则 NVIDIA driver 会在运行时对 PTX 进行 JIT compilation，生成当前 GPU 架构对应的 native machine code，并可将编译结果缓存起来。
+
+# prob 8.2 （EXPERIMENT・Optional）
+
+两个编译实验，对象是Module0的01_hello.cu。
+(a) 生成只含sm_90 SASS 的可执行文件并运行（如果你的卡本身就是computecapability9.0，
+先把ARCH_HIGH 调成 100 或更高再 make），记录报错信息。
+
+```bash
+$ make sassonly/m0_env/01_hello
+nvcc -O2 -std=c++17 -I. -gencode arch=compute_90,code=sm_90 -o bin/m0_env/01_hello_sassonly m0_env/01_hello.cu
+已生成 bin/m0_env/01_hello_sassonly（只含 sm_90 的机器码）
+$ ./bin/m0_env/01_hello_sassonly 
+CUDA error cudaErrorNoKernelImageForDevice at m0_env/01_hello.cu:11: no kernel image is available for execution on the device
+```
+
+> 运行失败，报 cudaErrorNoKernelImageForDevice。原因是可执行文件只包含针对 sm_90 生成的 SASS，而当前 GPU 为 sm_120；SASS 是 architecture-specific 的机器码，不能依赖跨架构向下兼容执行。
+
+(b)生成只含 compute_75 PTX 的版本（CUDA 13 起 compute_70 已被移除，Makefile 默认
+取75）并运行。能正常运行吗？PTX是在什么时候、由谁编译成这块卡的机器码的？
+
+```bash
+
+$ make ptxonly/m0_env/01_hello
+nvcc -O2 -std=c++17 -I. -gencode arch=compute_75,code=compute_75 -o bin/m0_env/01_hello_ptxonly m0_env/01_hello.cu
+已生成 bin/m0_env/01_hello_ptxonly（只含 compute_75 的 PTX）
+$ ./bin/m0_env/01_hello_ptxonly 
+hello from block 0, thread 0
+hello from block 0, thread 1
+hello from block 0, thread 2
+hello from block 0, thread 3
+hello from block 0, thread 4
+hello from block 0, thread 5
+hello from block 0, thread 6
+hello from block 0, thread 7
+hello from block 1, thread 0
+hello from block 1, thread 1
+hello from block 1, thread 2
+hello from block 1, thread 3
+hello from block 1, thread 4
+hello from block 1, thread 5
+hello from block 1, thread 6
+hello from block 1, thread 7
+hello from block 2, thread 0
+hello from block 2, thread 1
+hello from block 2, thread 2
+hello from block 2, thread 3
+hello from block 2, thread 4
+hello from block 2, thread 5
+hello from block 2, thread 6
+hello from block 2, thread 7
+hello from block 3, thread 0
+hello from block 3, thread 1
+hello from block 3, thread 2
+hello from block 3, thread 3
+hello from block 3, thread 4
+hello from block 3, thread 5
+hello from block 3, thread 6
+hello from block 3, thread 7
+```
+
+> 可以正常运行。可执行文件中只包含 compute_75 PTX，没有针对当前 GPU 的预编译 SASS。程序运行时，NVIDIA driver 会加载 PTX，并通过 JIT compilation 将其编译为当前 GPU 架构对应的机器码，例如本机的 sm_120 SASS，然后交给 GPU 执行。
+
+# Prob 8.3
+
+请简单说明Runtime API 与 Driver API 各自的定位。cudaMalloc 属于哪个？
+
+> CUDA Runtime API 建立在更底层的 CUDA Driver API 之上
+> CUDA Driver API 是 NVIDIA Driver 暴露出来的 API
+> cudaMalloc属于runtime API
+
+Runtime API通常以 cuda开头，例如 cudaMalloc ， cudaMemcpy ， cudaFree
+
+Driver API 更底层，通常以 cu开头
+
