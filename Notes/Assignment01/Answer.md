@@ -1479,3 +1479,41 @@ def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 和之前差不多，pid读取之后作为block id，triton是block层级的操作.
 
 设置好offsets和mask之后就能读取，操作
+
+# prob 7.2 （MODIFY）
+
+按文件开头注释要求修改：kernels/fused_op.py 
+
+```py
+"""问题 7.2：fused elementwise（改造题）。
+
+scale_kernel 目前功能完整，相应代码不要变动。
+fused_kernel 目前和 scale_kernel 完全一致，是你需要修改的 kernel。
+任务：改成 z = relu(a * x + b)，其中 a、b 是标量。
+TIP: 只需要动计算那一行，再把 a、b 传进 kernel——主体不变，
+这正是 Tile 视角的好处:-)。改完运行：
+    pytest tests/test_fused_op.py
+"""
+
+@triton.jit
+def fused_kernel(x_ptr, z_ptr, n, BLOCK_SIZE: tl.constexpr, a, b):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    z = tl.maximum(0, a*x + b)# TODO：改成 relu(a * x + b)，提示 tl.maximum
+    tl.store(z_ptr + offsets, z, mask=mask)
+
+
+def fused(x: torch.Tensor, a: float, b: float) -> torch.Tensor:
+    z = torch.empty_like(x)
+    n = x.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n, BLOCK_SIZE),)
+    fused_kernel[grid](x, z, n, BLOCK_SIZE=BLOCK_SIZE,a = a,b = b)  # TODO：把 a、b 传进去
+    return z
+```
+改完回答——与Module 2 里改 CUDA kernel 相比，这次的改动主要集中在 kernel 的什么部
+分？主体代码为什么一行都不用动？
+
+> 改动主要集中在 tile 内的逐元素计算表达式，即把原来的 x * 2 改成了 relu(a * x + b)，同时增加了标量参数 a、b。因为输入输出的 shape 和“一一对应的 elementwise 映射”没有改变，所以 program grid、offsets、mask、load 和 store 的数据访问模式都可以保持不变。Triton 把一个 program 对一整个 tile 的索引和数据搬运与 tile 内具体执行的 elementwise computation 分离开，因此只需要修改计算部分。
