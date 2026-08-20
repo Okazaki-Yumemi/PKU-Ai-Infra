@@ -1517,3 +1517,39 @@ def fused(x: torch.Tensor, a: float, b: float) -> torch.Tensor:
 分？主体代码为什么一行都不用动？
 
 > 改动主要集中在 tile 内的逐元素计算表达式，即把原来的 x * 2 改成了 relu(a * x + b)，同时增加了标量参数 a、b。因为输入输出的 shape 和“一一对应的 elementwise 映射”没有改变，所以 program grid、offsets、mask、load 和 store 的数据访问模式都可以保持不变。Triton 把一个 program 对一整个 tile 的索引和数据搬运与 tile 内具体执行的 elementwise computation 分离开，因此只需要修改计算部分。
+
+# Prob 7.3
+
+请填空：kernels/tilelang_scale_add.py ，具体要求见代码注释
+
+```py
+"""问题 7.3：TileLang 版 scale-add（填空）。
+
+Y = 2 * X + 1，X 形状 (M, N)。两个空对应 TileLang 的两个 basic operation。
+需要 GPU 和 tilelang（uv sync --extra tilelang），在集群上运行：
+    pytest tests/test_tilelang.py -k scale_add
+"""
+
+def make_scale_add(M, N, block_M=32, block_N=32, dtype="float32"):
+    @T.prim_func
+    def scale_add(
+        X: T.Buffer((M, N), dtype),
+        Y: T.Buffer((M, N), dtype),
+    ):
+        # ====== 空 1：二维 CTA grid——x 方向要多少个 block（管 N 列），
+        #         y 方向要多少个（管 M 行）？提示：T.ceildiv ======
+        x_blocks = T.ceildiv(N,block_N)
+        y_blocks = T.ceildiv(M,block_M)
+        with T.Kernel(x_blocks, y_blocks, threads=128) as (bx, by):
+            # ====== 空 2：block 内并行遍历 tile 的每个元素，
+            #         提示：T.Parallel(维度1, 维度2) ======
+            for i, j in T.Parallel(block_M,block_N):
+                gi = by * block_M + i
+                gj = bx * block_N + j
+                if gi < M and gj < N:
+                    Y[gi, gj] = X[gi, gj] * 2.0 + 1.0
+
+    return scale_add
+```
+
+首先拿到x,y block的数目，然后交给内核去管理，利用by\*block_M确定行，bx\*blockN 确定列
