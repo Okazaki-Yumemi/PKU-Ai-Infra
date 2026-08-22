@@ -960,3 +960,4 @@ Layout inference
 
 > TileLang 的核心价值不是“语法更短”，而是让程序员主要在 CTA / tile 层描述 workload、memory placement 和 dataflow，同时保留 `copy/gemm/reduce` 等高层 IR 语义，由 compiler 推导大量 thread-level layout 与 target-specific lowering。  
 > 性能上最重要的两条新主线是：`T.Pipelined` 用时间上的 overlap 隐藏 latency；Persistent 用有限长期存活 CTA 对更大的 task domain 做空间调度。最终仍需通过 tuning 与 profiling 判断配置是否真正更快。
+
